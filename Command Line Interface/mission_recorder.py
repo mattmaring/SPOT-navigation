@@ -17,10 +17,14 @@ import signal
 import threading
 import time
 import traceback
+import cv2
+import numpy as np
 
 from google.protobuf import wrappers_pb2 as wrappers
 
-from bosdyn.api import geometry_pb2, world_object_pb2
+from scipy import ndimage
+
+from bosdyn.api import geometry_pb2, world_object_pb2, image_pb2
 from bosdyn.api.graph_nav import graph_nav_pb2, map_pb2, map_processing_pb2, recording_pb2
 from bosdyn.api.mission import nodes_pb2
 import bosdyn.api.robot_state_pb2 as robot_state_proto
@@ -43,6 +47,7 @@ import bosdyn.client.util
 from bosdyn.util import duration_str, format_metric, secs_to_hms
 from bosdyn.client.frame_helpers import ODOM_FRAME_NAME
 from bosdyn.client.world_object import WorldObjectClient
+from bosdyn.client.image import ImageClient, build_image_request
 
 LOGGER = logging.getLogger()
 
