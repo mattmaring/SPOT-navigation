@@ -1,4 +1,4 @@
-# Copyright (c) 2021 Boston Dynamics, Inc.  All rights reserved.
+# Copyright (c) 2022 Boston Dynamics, Inc.  All rights reserved.
 #
 # Downloading, reproducing, distributing or otherwise using the SDK Software
 # is subject to the terms and conditions of the Boston Dynamics Software
@@ -36,7 +36,7 @@ from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
 from bosdyn.client.map_processing import MapProcessingServiceClient
 from bosdyn.client.power import PowerClient
 from bosdyn.client.robot_command import RobotCommandClient, RobotCommandBuilder
-from bosdyn.client.recording import GraphNavRecordingServiceClient, NotLocalizedToEndError
+from bosdyn.client.recording import GraphNavRecordingServiceClient, NotLocalizedToEndError, NotReadyYetError
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.time_sync import TimeSyncError
 import bosdyn.client.util
@@ -161,11 +161,11 @@ class RecorderInterface(object):
         self._robot_command_client = robot.ensure_client(RobotCommandClient.default_service_name)
         self._world_object_client = robot.ensure_client(WorldObjectClient.default_service_name)
 
-        # Setup the recording service client.
+        # Set up the recording service client.
         self._recording_client = self._robot.ensure_client(
             GraphNavRecordingServiceClient.default_service_name)
 
-        # Setup the graph nav service client.
+        # Set up the graph nav service client.
         self._graph_nav_client = robot.ensure_client(GraphNavClient.default_service_name)
 
         # Local copy of the graph.
@@ -195,7 +195,16 @@ class RecorderInterface(object):
             ord('l'): self._relocalize,
             ord('z'): self._enter_desert,
             ord('x'): self._exit_desert,
-            ord('g'): self._generate_mission
+            ord('g'): self._generate_mission,
+            ord('1'): self._take_back_fisheye_image,
+            ord('2'): self._take_left_fisheye_image,
+            ord('3'): self._take_frontleft_fisheye_image,
+            ord('4'): self._take_frontright_fisheye_image,
+            ord('5'): self._take_right_fisheye_image,
+            ord('6'): self._take_hand_color_image
+            # ord('7'): self._
+            # ord('8'): self._
+            # ord('9'): self._
         }
         self._locked_messages = ['', '', '']  # string: displayed message for user
         self._estop_keepalive = None
@@ -203,12 +212,11 @@ class RecorderInterface(object):
 
         # Stuff that is set in start()
         self._robot_id = None
-        self._lease = None
+        self._lease_keep_alive = None
 
-    def start(self):
+    def start(self, lease_keep_alive):
         """Begin communication with the robot."""
-        self._lease = self._lease_client.acquire()
-
+        self._lease_keep_alive = lease_keep_alive
         self._robot_id = self._robot.get_id()
         if self._estop_endpoint is not None:
             self._estop_endpoint.force_simple_setup(
@@ -223,9 +231,6 @@ class RecorderInterface(object):
         if self._estop_keepalive:
             # This stops the check-in thread but does not stop the robot.
             self._estop_keepalive.shutdown()
-        if self._lease:
-            _grpc_or_log("returning lease", lambda: self._lease_client.return_lease(self._lease))
-            self._lease = None
 
     def __del__(self):
         self.shutdown()
@@ -255,8 +260,7 @@ class RecorderInterface(object):
 
     def drive(self, stdscr):
         """User interface to control the robot via the passed-in curses screen interface object."""
-        with LeaseKeepAlive(self._lease_client) as lease_keep_alive, \
-             ExitCheck() as self._exit_check:
+        with ExitCheck() as self._exit_check:
             curses_handler = CursesHandler(self)
             curses_handler.setLevel(logging.INFO)
             LOGGER.addHandler(curses_handler)
@@ -271,7 +275,7 @@ class RecorderInterface(object):
             try:
                 while not self._exit_check.kill_now:
                     self._async_tasks.update()
-                    self._drive_draw(stdscr, lease_keep_alive)
+                    self._drive_draw(stdscr, self._lease_keep_alive)
 
                     try:
                         cmd = stdscr.getch()
@@ -315,13 +319,14 @@ class RecorderInterface(object):
         stdscr.addstr(14, 0, "Commands: [TAB]: quit                               ")
         stdscr.addstr(15, 0, "          [T]: Time-sync, [SPACE]: Estop, [P]: Power")
         stdscr.addstr(16, 0, "          [v]: Sit, [f]: Stand, [r]: Self-right     ")
-        stdscr.addstr(17, 0, "          [wasd]: Directional strafing              ")
-        stdscr.addstr(18, 0, "          [qe]: Turning, [ESC]: Stop                ")
-        stdscr.addstr(19, 0, "          [m]: Start recording mission              ")
-        stdscr.addstr(20, 0, "          [l]: Add fiducial localization to mission ")
-        stdscr.addstr(21, 0, "          [z]: Enter desert mode                    ")
-        stdscr.addstr(22, 0, "          [x]: Exit desert mode                     ")
-        stdscr.addstr(23, 0, "          [g]: Stop recording and generate mission  ")
+        stdscr.addstr(17, 0, "			[1-6]: Take image (back, left, frontleft, frontright, right)")
+        stdscr.addstr(18, 0, "          [wasd]: Directional strafing              ")
+        stdscr.addstr(19, 0, "          [qe]: Turning, [ESC]: Stop                ")
+        stdscr.addstr(20, 0, "          [m]: Start recording mission              ")
+        stdscr.addstr(21, 0, "          [l]: Add fiducial localization to mission ")
+        stdscr.addstr(22, 0, "          [z]: Enter desert mode                    ")
+        stdscr.addstr(23, 0, "          [x]: Exit desert mode                     ")
+        stdscr.addstr(24, 0, "          [g]: Stop recording and generate mission  ")
 
         stdscr.refresh()
 
@@ -442,7 +447,8 @@ class RecorderInterface(object):
 
     def _lease_str(self, lease_keep_alive):
         alive = 'RUNNING' if lease_keep_alive.is_alive() else 'STOPPED'
-        lease = '{}:{}'.format(self._lease.lease_proto.resource, self._lease.lease_proto.sequence)
+        lease_proto = lease_keep_alive.lease_wallet.get_lease_state().lease_original.lease_proto
+        lease = '{}:{}'.format(lease_proto.resource, lease_proto.sequence)
         return 'Lease {} THREAD:{}'.format(lease, alive)
 
     def _power_state_str(self):
@@ -586,16 +592,25 @@ class RecorderInterface(object):
             self._waypoint_commands += [self._waypoint_id]
 
         try:
-            status = self._recording_client.stop_recording()
-            if status != recording_pb2.StopRecordingResponse.STATUS_OK:
-                self.add_message("Stop recording failed.")
-                return False
+            finished_recording = False
+            status = recording_pb2.StopRecordingResponse.STATUS_UNKNOWN
+            while True:
+                try:
+                    status = self._recording_client.stop_recording()
+                except NotReadyYetError:
+                    # The recording service always takes some time to complete. stop_recording
+                    # must be called multiple times to ensure recording has finished.
+                    self.add_message("Stopping...")
+                    time.sleep(1.0)
+                    continue
+                break
 
             self.add_message("Successfully stopped recording a map.")
             return True
 
         except NotLocalizedToEndError:
-            self.add_message("ERROR: Move to final waypoint before stopping recording.")
+            # This should never happen unless there's an internal error on the robot.
+            self.add_message("There was a problem while trying to stop recording. Please try again.")
             return False
 
     def _relocalize(self):
@@ -623,7 +638,77 @@ class RecorderInterface(object):
         if self._recording:
             if self._waypoint_commands == [] or self._waypoint_commands[-1] != self._waypoint_id:
                 self._waypoint_commands += [self._waypoint_id]
+                
+    def _take_back_fisheye_image(self):
+    	self.take_image("back_fisheye_image")
+    
+    def _take_left_fisheye_image(self):
+    	self.take_image("frontleft_fisheye_image")
+    
+    def _take_frontleft_fisheye_image(self):
+    	self.take_image("frontright_fisheye_image")
+    
+    def _take_frontright_fisheye_image(self):
+    	self.take_image("left_fisheye_image")	
+	
+    def _take_right_fisheye_image(self):
+    	self.take_image("right_fisheye_image")
+    
+    def _take_hand_color_image(self):
+    	self.take_image("hand_color_image")
+    
+    def take_image(self, image_source_name):
+    	# Create robot object with an image client.
+    	sdk = bosdyn.client.create_standard_sdk('image_capture')
+    	robot = sdk.create_robot(options.hostname)
+    	bosdyn.client.util.authenticate(robot)
+    	robot.sync_with_directory()
+    	robot.time_sync.wait_for_sync()
 
+    	image_client = robot.ensure_client('image')
+
+    	# Capture and save images to disk
+    	pixel_format = dict(image_pb2.Image.PixelFormat.items()).get(None)
+    	image_request = [build_image_request(image_source_name, pixel_format=pixel_format)]
+    	image = image_client.get_image(image_request)[0]
+
+    	num_bytes = 1  # Assume a default of 1 byte encodings.
+    	if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
+    		dtype = np.uint16
+    		extension = ".png"
+    	else:
+    		if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGB_U8:
+    			num_bytes = 3
+    		elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGBA_U8:
+    			num_bytes = 4
+    		elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U8:
+    			num_bytes = 1
+    		elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U16:
+    			num_bytes = 2
+    		dtype = np.uint8
+    		extension = ".jpg"
+
+    	img = np.frombuffer(image.shot.image.data, dtype=dtype)
+    	if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
+    		try:
+    			# Attempt to reshape array into a RGB rows X cols shape.
+    			img = img.reshape((image.shot.image.rows, image.shot.image.cols, num_bytes))
+    		except ValueError:
+    			# Unable to reshape the image data, trying a regular decode.
+    			img = cv2.imdecode(img, -1)
+    	else:
+    		img = cv2.imdecode(img, -1)
+
+    	ROTATION_ANGLE = {'back_fisheye_image': 0, 'frontleft_fisheye_image': -78, 'frontright_fisheye_image': -102, 'left_fisheye_image': 0, 'right_fisheye_image': 180}
+    	img = ndimage.rotate(img, ROTATION_ANGLE[image.source.name])
+    	
+    	# Save the image from the GetImage request to the current directory with the filename
+    	# matching that of the image source.
+    	image_saved_path = image.source.name
+    	image_saved_path = image_saved_path.replace(
+			"/", '')  # Remove any slashes from the filename the image is saved at locally.
+    	cv2.imwrite(image_saved_path + extension, img)
+	
     def _generate_mission(self):
         """Save graph map and mission file."""
 
@@ -929,7 +1014,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    bosdyn.client.util.add_common_arguments(parser)
+    bosdyn.client.util.add_base_arguments(parser)
     parser.add_argument('directory', help='Output directory for graph map and mission file.')
     parser.add_argument('--time-sync-interval-sec',
                         help='The interval (seconds) that time-sync estimate should be updated.',
@@ -949,7 +1034,7 @@ def main():
     sdk = create_standard_sdk('MissionRecorderClient')
     robot = sdk.create_robot(options.hostname)
     try:
-        robot.authenticate(options.username, options.password)
+        bosdyn.client.util.authenticate(robot)
         robot.start_time_sync(options.time_sync_interval_sec)
     except RpcError as err:
         LOGGER.error("Failed to communicate with robot: %s" % err)
@@ -975,23 +1060,24 @@ def main():
         write_mission(mission, mission_filepath)
         return True
 
-    try:
-        recorder_interface.start()
-    except (ResponseError, RpcError) as err:
-        LOGGER.error("Failed to initialize robot communication: %s" % err)
-        return False
+    with LeaseKeepAlive(recorder_interface._lease_client, must_acquire=True, return_at_exit=True) as lease_keep_alive:
+        try:
+            recorder_interface.start(lease_keep_alive)
+        except (ResponseError, RpcError) as err:
+            LOGGER.error("Failed to initialize robot communication: %s" % err)
+            return False
 
-    try:
-        # Prevent curses from introducing a 1 second delay for ESC key
-        os.environ.setdefault('ESCDELAY', '0')
-        # Run recorder interface in curses mode, then restore terminal config.
-        curses.wrapper(recorder_interface.drive)
-    except Exception as e:
-        LOGGER.error("Mission recorder has thrown an error: %s" % repr(e))
-        LOGGER.error(traceback.format_exc())
-    finally:
-        # Restore stream handler after curses mode.
-        LOGGER.addHandler(stream_handler)
+        try:
+            # Prevent curses from introducing a 1 second delay for ESC key
+            os.environ.setdefault('ESCDELAY', '0')
+            # Run recorder interface in curses mode, then restore terminal config.
+            curses.wrapper(recorder_interface.drive)
+        except Exception as e:
+            LOGGER.error("Mission recorder has thrown an error: %s" % repr(e))
+            LOGGER.error(traceback.format_exc())
+        finally:
+            # Restore stream handler after curses mode.
+            LOGGER.addHandler(stream_handler)
 
     return True
 
