@@ -4,6 +4,10 @@
 # is subject to the terms and conditions of the Boston Dynamics Software
 # Development Kit License (20191101-BDSDK-SL).
 
+# Matthew Maring (c) 2022
+# Colby College Insite Lab
+# Spot Data Explorer
+
 """
 Interactive command-line mission recorder
 """
@@ -165,6 +169,7 @@ class RecorderInterface(object):
         self._robot_state_client = robot.ensure_client(RobotStateClient.default_service_name)
         self._robot_command_client = robot.ensure_client(RobotCommandClient.default_service_name)
         self._world_object_client = robot.ensure_client(WorldObjectClient.default_service_name)
+        self._image_client = robot.ensure_client(ImageClient.default_service_name)
 
         # Set up the recording service client.
         self._recording_client = self._robot.ensure_client(
@@ -663,19 +668,10 @@ class RecorderInterface(object):
     	self.take_image("hand_color_image")
     
     def take_image(self, image_source_name):
-    	# Create robot object with an image client.
-    	sdk = bosdyn.client.create_standard_sdk('image_capture')
-    	robot = sdk.create_robot(options.hostname)
-    	bosdyn.client.util.authenticate(robot)
-    	robot.sync_with_directory()
-    	robot.time_sync.wait_for_sync()
-
-    	image_client = robot.ensure_client('image')
-
     	# Capture and save images to disk
     	pixel_format = dict(image_pb2.Image.PixelFormat.items()).get(None)
     	image_request = [build_image_request(image_source_name, pixel_format=pixel_format)]
-    	image = image_client.get_image(image_request)[0]
+    	image = self._image_client.get_image(image_request)[0]
 
     	num_bytes = 1  # Assume a default of 1 byte encodings.
     	if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
@@ -709,10 +705,13 @@ class RecorderInterface(object):
     	
     	# Save the image from the GetImage request to the current directory with the filename
     	# matching that of the image source.
-    	image_saved_path = image.source.name
-    	image_saved_path = image_saved_path.replace(
+    	os.mkdir(self._download_filepath)
+    	image_saved_path = os.path.join(self._download_filepath, "images")
+    	os.mkdir(image_saved_path)
+    	image_saved_name = image.source.name
+    	image_saved_name = image_saved_name.replace(
 			"/", '')  # Remove any slashes from the filename the image is saved at locally.
-    	cv2.imwrite(image_saved_path + extension, img)
+    	cv2.imwrite(image_saved_path + image_saved_name + extension, img)
 	
     def _generate_mission(self):
         """Save graph map and mission file."""
@@ -1046,6 +1045,8 @@ def main():
         return False
 
     recorder_interface = RecorderInterface(robot, options.directory)
+    
+    image_client = robot.ensure_client('image')
 
     if options.waypoint_commands_only is not None:
         recorder_interface._waypoint_commands = options.waypoint_commands_only
