@@ -211,7 +211,12 @@ class RecorderInterface(object):
             ord('3'): self._take_frontleft_fisheye_image,
             ord('4'): self._take_frontright_fisheye_image,
             ord('5'): self._take_right_fisheye_image,
-            ord('6'): self._take_hand_color_image
+            ord('6'): self._take_hand_color_image,
+            ord('-'): self._decrease_speed,
+            ord('='): self._increase_speed,
+            ord('['): self._decrease_accuracy,
+            ord(']'): self._increase_accuracy
+            
             # ord('7'): self._
             # ord('8'): self._
             # ord('9'): self._
@@ -313,30 +318,32 @@ class RecorderInterface(object):
     def _drive_draw(self, stdscr, lease_keep_alive):
         """Draw the interface screen at each update."""
         stdscr.clear()  # clear screen
-        stdscr.resize(26, 96)
+        stdscr.resize(28, 96)
         stdscr.addstr(0, 0, '{:20s} {}'.format(self._robot_id.nickname,
                                                self._robot_id.serial_number))
         stdscr.addstr(1, 0, self._lease_str(lease_keep_alive))
         stdscr.addstr(2, 0, self._battery_str())
         stdscr.addstr(3, 0, self._estop_str())
         stdscr.addstr(4, 0, self._power_state_str())
-        stdscr.addstr(5, 0, self._time_sync_str())
-        stdscr.addstr(6, 0, self._waypoint_str())
-        stdscr.addstr(7, 0, self._fiducial_str())
-        stdscr.addstr(8, 0, self._desert_str())
+        stdscr.addstr(5, 0, self._speed_str())
+        stdscr.addstr(6, 0, self._accuracy_str())
+        stdscr.addstr(7, 0, self._time_sync_str())
+        stdscr.addstr(8, 0, self._waypoint_str())
+        stdscr.addstr(9, 0, self._fiducial_str())
+        stdscr.addstr(10, 0, self._desert_str())
         for i in range(3):
-            stdscr.addstr(10 + i, 2, self.message(i))
-        stdscr.addstr(14, 0, "Commands: [TAB]: quit                               ")
-        stdscr.addstr(15, 0, "          [T]: Time-sync, [SPACE]: Estop, [P]: Power")
-        stdscr.addstr(16, 0, "          [v]: Sit, [f]: Stand, [r]: Self-right     ")
-        stdscr.addstr(17, 0, "			[1-6]: Take image (back, left, frontleft, frontright, right)")
-        stdscr.addstr(18, 0, "          [wasd]: Directional strafing              ")
-        stdscr.addstr(19, 0, "          [qe]: Turning, [ESC]: Stop                ")
-        stdscr.addstr(20, 0, "          [m]: Start recording mission              ")
-        stdscr.addstr(21, 0, "          [l]: Add fiducial localization to mission ")
-        stdscr.addstr(22, 0, "          [z]: Enter desert mode                    ")
-        stdscr.addstr(23, 0, "          [x]: Exit desert mode                     ")
-        stdscr.addstr(24, 0, "          [g]: Stop recording and generate mission  ")
+            stdscr.addstr(11 + i, 2, self.message(i))
+        stdscr.addstr(16, 0, "Commands: [TAB]: quit                               ")
+        stdscr.addstr(17, 0, "          [T]: Time-sync, [SPACE]: Estop, [P]: Power")
+        stdscr.addstr(18, 0, "          [v]: Sit, [f]: Stand, [r]: Self-right     ")
+        stdscr.addstr(19, 0, "          [1-6]: Take image (b, l, fl, fr, r)       ")
+        stdscr.addstr(20, 0, "          [wasd]: Directional strafing              ")
+        stdscr.addstr(21, 0, "          [qe]: Turning, [ESC]: Stop                ")
+        stdscr.addstr(22, 0, "          [m]: Start recording mission              ")
+        stdscr.addstr(23, 0, "          [l]: Add fiducial localization to mission ")
+        stdscr.addstr(24, 0, "          [z]: Enter desert mode                    ")
+        stdscr.addstr(25, 0, "          [x]: Exit desert mode                     ")
+        stdscr.addstr(26, 0, "          [g]: Stop recording and generate mission  ")
 
         stdscr.refresh()
 
@@ -418,6 +425,38 @@ class RecorderInterface(object):
 
     def _stop(self):
         self._start_robot_command('stop', RobotCommandBuilder.stop_command())
+        
+    def _increase_speed(self):
+    	global VELOCITY_BASE_SPEED
+    	if VELOCITY_BASE_SPEED < 1.5:
+    		VELOCITY_BASE_SPEED *= 10.0
+    		VELOCITY_BASE_SPEED = int(VELOCITY_BASE_SPEED)
+    		VELOCITY_BASE_SPEED += 1.0
+    		VELOCITY_BASE_SPEED /= 10.0
+    
+    def _decrease_speed(self):
+    	global VELOCITY_BASE_SPEED
+    	if VELOCITY_BASE_SPEED > 0.1:
+    		VELOCITY_BASE_SPEED *= 10.0
+    		VELOCITY_BASE_SPEED = int(VELOCITY_BASE_SPEED)
+    		VELOCITY_BASE_SPEED -= 1.0
+    		VELOCITY_BASE_SPEED /= 10.0
+    
+    def _increase_accuracy(self):
+    	global VELOCITY_CMD_DURATION
+    	if VELOCITY_CMD_DURATION < 1.0:
+    		VELOCITY_CMD_DURATION *= 10.0
+    		VELOCITY_CMD_DURATION = int(VELOCITY_CMD_DURATION)
+    		VELOCITY_CMD_DURATION += 1.0
+    		VELOCITY_CMD_DURATION /= 10.0
+    
+    def _decrease_accuracy(self):
+    	global VELOCITY_CMD_DURATION
+    	if VELOCITY_CMD_DURATION > 0.1:
+    		VELOCITY_CMD_DURATION *= 10.0
+    		VELOCITY_CMD_DURATION = int(VELOCITY_CMD_DURATION)
+    		VELOCITY_CMD_DURATION -= 1.0
+    		VELOCITY_CMD_DURATION /= 10.0
 
     def _velocity_cmd_helper(self, desc='', v_x=0.0, v_y=0.0, v_rot=0.0):
         self._start_robot_command(
@@ -467,6 +506,18 @@ class RecorderInterface(object):
             return ''
         state_str = robot_state_proto.PowerState.MotorPowerState.Name(power_state)
         return 'Power: {}'.format(state_str[6:])  # get rid of STATE_ prefix
+    
+    def _speed_str(self):
+        power_state = self._power_state()
+        if power_state is None:
+            return ''
+        return 'Speed: {}'.format(VELOCITY_BASE_SPEED)
+        
+    def _accuracy_str(self):
+        power_state = self._power_state()
+        if power_state is None:
+            return ''
+        return 'Command Duration: {}'.format(VELOCITY_CMD_DURATION)
 
     def _estop_str(self):
         if not self._estop_client:
@@ -653,13 +704,13 @@ class RecorderInterface(object):
     	self.take_image("back_fisheye_image")
     
     def _take_left_fisheye_image(self):
-    	self.take_image("frontleft_fisheye_image")
+    	self.take_image("left_fisheye_image")
     
     def _take_frontleft_fisheye_image(self):
-    	self.take_image("frontright_fisheye_image")
+    	self.take_image("frontleft_fisheye_image")
     
     def _take_frontright_fisheye_image(self):
-    	self.take_image("left_fisheye_image")	
+    	self.take_image("frontright_fisheye_image")	
 	
     def _take_right_fisheye_image(self):
     	self.take_image("right_fisheye_image")
@@ -700,18 +751,18 @@ class RecorderInterface(object):
     	else:
     		img = cv2.imdecode(img, -1)
 
-    	ROTATION_ANGLE = {'back_fisheye_image': 0, 'frontleft_fisheye_image': -78, 'frontright_fisheye_image': -102, 'left_fisheye_image': 0, 'right_fisheye_image': 180}
+    	ROTATION_ANGLE = {'back_fisheye_image': 0, 'frontleft_fisheye_image': -78, 'frontright_fisheye_image': -102, 'left_fisheye_image': 0, 'right_fisheye_image': 180, 'hand_color_image': 0}
     	img = ndimage.rotate(img, ROTATION_ANGLE[image.source.name])
     	
     	# Save the image from the GetImage request to the current directory with the filename
     	# matching that of the image source.
-    	os.mkdir(self._download_filepath)
+    	if not os.path.exists(self._download_filepath):
+    		os.mkdir(self._download_filepath)
     	image_saved_path = os.path.join(self._download_filepath, "images")
-    	os.mkdir(image_saved_path)
-    	image_saved_name = image.source.name
-    	image_saved_name = image_saved_name.replace(
-			"/", '')  # Remove any slashes from the filename the image is saved at locally.
-    	cv2.imwrite(image_saved_path + image_saved_name + extension, img)
+    	if not os.path.exists(image_saved_path):
+    		os.mkdir(image_saved_path)
+    	image_saved_name = image.source.name.replace("/", '')
+    	cv2.imwrite(image_saved_path + "/" + image_saved_name + extension, img)
 	
     def _generate_mission(self):
         """Save graph map and mission file."""
@@ -732,7 +783,8 @@ class RecorderInterface(object):
             return
 
         # Save graph map
-        os.mkdir(self._download_filepath)
+        if not os.path.exists(self._download_filepath):
+        	os.mkdir(self._download_filepath)
         if not self._download_full_graph():
             self.add_message("ERROR: Error downloading graph.")
             return
