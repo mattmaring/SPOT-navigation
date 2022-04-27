@@ -13,16 +13,22 @@ Interactive command-line mission recorder
 """
 
 from __future__ import print_function
+from collections import OrderedDict
 
 import curses
 import logging
+import io
 import os
 import signal
+import sys
 import threading
 import time
 import traceback
 import cv2
 import numpy as np
+import asyncio
+
+from PIL import Image, ImageEnhance
 
 from google.protobuf import wrappers_pb2 as wrappers
 
@@ -31,13 +37,16 @@ from scipy import ndimage
 from bosdyn.api import geometry_pb2, world_object_pb2, image_pb2
 from bosdyn.api.graph_nav import graph_nav_pb2, map_pb2, map_processing_pb2, recording_pb2
 from bosdyn.api.mission import nodes_pb2
+import bosdyn.api.power_pb2 as PowerServiceProto
 import bosdyn.api.robot_state_pb2 as robot_state_proto
+import bosdyn.api.basic_command_pb2 as basic_command_pb2
 import bosdyn.api.spot.robot_command_pb2 as spot_command_pb2
 
 import bosdyn.client
 from bosdyn.client import create_standard_sdk, ResponseError, RpcError
 from bosdyn.client.async_tasks import AsyncPeriodicQuery, AsyncTasks
 import bosdyn.client.channel
+from bosdyn.client.async_tasks import AsyncGRPCTask, AsyncPeriodicQuery, AsyncTasks
 from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
 from bosdyn.client.graph_nav import GraphNavClient
 from bosdyn.client.lease import LeaseClient, LeaseKeepAlive
@@ -47,6 +56,7 @@ from bosdyn.client.robot_command import RobotCommandClient, RobotCommandBuilder
 from bosdyn.client.recording import GraphNavRecordingServiceClient, NotLocalizedToEndError, NotReadyYetError
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.time_sync import TimeSyncError
+from bosdyn.client.time_sync import TimedOutError
 import bosdyn.client.util
 from bosdyn.util import duration_str, format_metric, secs_to_hms
 from bosdyn.client.frame_helpers import ODOM_FRAME_NAME
@@ -56,7 +66,7 @@ from bosdyn.client.image import ImageClient, build_image_request
 LOGGER = logging.getLogger()
 
 VELOCITY_BASE_SPEED = 0.5  # m/s
-VELOCITY_BASE_ANGULAR = 0.8  # rad/sec
+VELOCITY_BASE_ANGULAR = 1.2  # rad/sec
 VELOCITY_CMD_DURATION = 0.6  # seconds
 COMMAND_INPUT_RATE = 0.1
 
@@ -77,6 +87,43 @@ def _grpc_or_log(desc, thunk):
         return thunk()
     except (ResponseError, RpcError) as err:
         LOGGER.error("Failed %s: %s" % (desc, err))
+        
+def _image_to_opencv(image):
+    """Convert an image proto message to an openCV image."""
+    num_channels = 1  # Assume a default of 1 byte encodings.
+    if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
+        dtype = np.uint16
+        extension = ".png"
+    else:
+        dtype = np.uint8
+        if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGB_U8:
+            num_channels = 3
+        elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGBA_U8:
+            num_channels = 4
+        elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U8:
+            num_channels = 1
+        elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U16:
+            num_channels = 1
+            dtype = np.uint16
+        extension = ".jpg"
+        
+    img = np.frombuffer(image.shot.image.data, dtype=dtype)
+    if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
+        try:
+            # Attempt to reshape array into a RGB rows X cols shape.
+            img = img.reshape((image.shot.image.rows, image.shot.image.cols, num_channels))
+        except ValueError:
+            # Unable to reshape the image data, trying a regular decode.
+            img = cv2.imdecode(img, -1)
+    else:
+        img = cv2.imdecode(img, -1)
+
+    ROTATION_ANGLE = {'back_fisheye_image': 0, 'frontleft_fisheye_image': -78,
+                      'frontright_fisheye_image': -102, 'left_fisheye_image': 0,
+                      'right_fisheye_image': 180, 'hand_color_image': 0}
+    img = ndimage.rotate(img, ROTATION_ANGLE[image.source.name])
+
+    return img, extension
 
 
 class ExitCheck(object):
@@ -128,6 +175,48 @@ class AsyncRobotState(AsyncPeriodicQuery):
 
     def _start_query(self):
         return self._client.get_robot_state_async()
+
+class AsyncImageCapture(AsyncGRPCTask):
+    """Grab camera images from the robot."""
+
+    def __init__(self, robot):
+        super(AsyncImageCapture, self).__init__()
+        self._image_client = robot.ensure_client(ImageClient.default_service_name)
+        self._image = None
+        self._video_mode = False
+        self._should_take_image = False
+        self._source_name = "frontright_fisheye_image"
+
+    @property
+    def image(self):
+        """Return the latest captured image."""
+        return self._image
+    
+    def source_name(self):
+        """Return the latest captured images' source name."""
+        return self._source_name
+
+    def toggle_video_mode(self):
+        """Toggle whether doing continuous image capture."""
+        self._video_mode = not self._video_mode
+
+    def take_image(self):
+        """Request a one-shot image."""
+        self._should_take_image = True
+
+    def _start_query(self):
+        self._should_take_image = False
+        return self._image_client.get_image_from_sources_async([self._source_name])
+
+    def _should_query(self, now_sec):  # pylint: disable=unused-argument
+        return self._video_mode or self._should_take_image
+
+    def _handle_result(self, result):
+        image, _ = _image_to_opencv(result[0])
+        self._image = image
+        
+    def _handle_error(self, exception):
+        LOGGER.exception("Failure getting image: %s" % exception)
 
 
 class RecorderInterface(object):
@@ -183,16 +272,24 @@ class RecorderInterface(object):
         self._all_graph_wps_in_order = []
 
         self._robot_state_task = AsyncRobotState(self._robot_state_client)
-        self._async_tasks = AsyncTasks([self._robot_state_task])
+        self._image_task = AsyncImageCapture(robot)
+        self._async_tasks = AsyncTasks([self._robot_state_task, self._image_task])
         self._lock = threading.Lock()
         self._command_dictionary = {
             27: self._stop, # ESC key
+            #258: self._view_back_fisheye_image,
+            #259: self._view_hand_color_image,
+            #260: self._view_left_fisheye_image,
+            #261: self._view_right_fisheye_image,
+            #ord(','): self._view_frontleft_fisheye_image,
+            #ord('.'): self._view_frontright_fisheye_image,
             ord('\t'): self._quit_program,
             ord('T'): self._toggle_time_sync,
             ord(' '): self._toggle_estop,
             ord('r'): self._self_right,
             ord('P'): self._toggle_power,
             ord('v'): self._sit,
+            ord('b'): self._battery_change_pose,
             ord('f'): self._stand,
             ord('w'): self._move_forward,
             ord('s'): self._move_backward,
@@ -201,8 +298,12 @@ class RecorderInterface(object):
             ord('d'): self._strafe_right,
             ord('q'): self._turn_left,
             ord('e'): self._turn_right,
+            #ord('I'): self._image_task.take_image,
+            #ord('O'): self._image_task.toggle_video_mode,
             ord('m'): self._start_recording,
             ord('l'): self._relocalize,
+            ord('u'): self._unstow,
+            ord('j'): self._stow,
             ord('z'): self._enter_desert,
             ord('x'): self._exit_desert,
             ord('g'): self._generate_mission,
@@ -281,7 +382,7 @@ class RecorderInterface(object):
             LOGGER.addHandler(curses_handler)
 
             stdscr.nodelay(True)  # Don't block for user input.
-            stdscr.resize(26, 96)
+            stdscr.resize(34, 96)
             stdscr.refresh()
 
             # for debug
@@ -318,7 +419,7 @@ class RecorderInterface(object):
     def _drive_draw(self, stdscr, lease_keep_alive):
         """Draw the interface screen at each update."""
         stdscr.clear()  # clear screen
-        stdscr.resize(28, 96)
+        stdscr.resize(34, 96)
         stdscr.addstr(0, 0, '{:20s} {}'.format(self._robot_id.nickname,
                                                self._robot_id.serial_number))
         stdscr.addstr(1, 0, self._lease_str(lease_keep_alive))
@@ -335,16 +436,24 @@ class RecorderInterface(object):
             stdscr.addstr(11 + i, 2, self.message(i))
         stdscr.addstr(16, 0, "Commands: [TAB]: quit                               ")
         stdscr.addstr(17, 0, "          [T]: Time-sync, [SPACE]: Estop, [P]: Power")
-        stdscr.addstr(18, 0, "          [v]: Sit, [f]: Stand, [r]: Self-right     ")
-        stdscr.addstr(19, 0, "          [1-6]: Take image (b, l, fl, fr, r)       ")
-        stdscr.addstr(20, 0, "          [wasd]: Directional strafing              ")
-        stdscr.addstr(21, 0, "          [qe]: Turning, [ESC]: Stop                ")
-        stdscr.addstr(22, 0, "          [m]: Start recording mission              ")
-        stdscr.addstr(23, 0, "          [l]: Add fiducial localization to mission ")
-        stdscr.addstr(24, 0, "          [z]: Enter desert mode                    ")
-        stdscr.addstr(25, 0, "          [x]: Exit desert mode                     ")
-        stdscr.addstr(26, 0, "          [g]: Stop recording and generate mission  ")
-
+        stdscr.addstr(18, 0, "          Speed Decrease: [-] Increase: [=]         ")
+        stdscr.addstr(19, 0, "          Accuracy Decrease: [[] Increase: []]      ")
+        stdscr.addstr(20, 0, "          [v]: Sit, [f]: Stand, [r]: Self-right     ")
+        stdscr.addstr(21, 0, "          [b]: Charging position                    ")
+        stdscr.addstr(22, 0, "          [1-6]: Take image (b, l, fl, fr, r)       ")
+        stdscr.addstr(23, 0, "          [u]: Unstow, [j]: Stow                    ")
+        stdscr.addstr(24, 0, "          [wasd]: Directional strafing              ")
+        stdscr.addstr(25, 0, "          [qe]: Turning, [ESC]: Stop                ")
+        stdscr.addstr(26, 0, "          [m]: Start recording mission              ")
+        stdscr.addstr(27, 0, "          [l]: Add fiducial localization to mission ")
+        stdscr.addstr(28, 0, "          [z]: Enter desert mode                    ")
+        stdscr.addstr(29, 0, "          [x]: Exit desert mode                     ")
+        stdscr.addstr(30, 0, "          [g]: Stop recording and generate mission  ")
+        
+        if self._image_task.image is not None:
+            cv2.setWindowProperty('Viewer', cv2.WND_PROP_AUTOSIZE, cv2.WINDOW_AUTOSIZE)
+            cv2.imshow('Viewer', self._image_task.image)
+        
         stdscr.refresh()
 
     def _drive_cmd(self, key):
@@ -363,6 +472,18 @@ class RecorderInterface(object):
         except (ResponseError, RpcError) as err:
             self.add_message("Failed {}: {}".format(desc, err))
             return None
+    
+    def _try_grpc_async(self, desc, thunk):
+
+        def on_future_done(fut):
+            try:
+                fut.result()
+            except (ResponseError, RpcError, LeaseBaseError) as err:
+                self.add_message("Failed {}: {}".format(desc, err))
+                return None
+
+        future = thunk()
+        future.add_done_callback(on_future_done)
 
     def _quit_program(self):
         if self._recording:
@@ -399,6 +520,12 @@ class RecorderInterface(object):
     def _self_right(self):
         self._start_robot_command('self_right', RobotCommandBuilder.selfright_command())
 
+    def _battery_change_pose(self):
+        self._start_robot_command(
+            'battery_change_pose',
+            RobotCommandBuilder.battery_change_pose_command(
+                dir_hint=basic_command_pb2.BatteryChangePoseCommand.Request.HINT_LEFT))
+
     def _sit(self):
         self._start_robot_command('sit', RobotCommandBuilder.synchro_sit_command())
 
@@ -427,41 +554,47 @@ class RecorderInterface(object):
         self._start_robot_command('stop', RobotCommandBuilder.stop_command())
         
     def _increase_speed(self):
-    	global VELOCITY_BASE_SPEED
-    	if VELOCITY_BASE_SPEED < 1.5:
-    		VELOCITY_BASE_SPEED *= 10.0
-    		VELOCITY_BASE_SPEED = int(VELOCITY_BASE_SPEED)
-    		VELOCITY_BASE_SPEED += 1.0
-    		VELOCITY_BASE_SPEED /= 10.0
+        global VELOCITY_BASE_SPEED
+        if VELOCITY_BASE_SPEED < 1.5:
+            VELOCITY_BASE_SPEED *= 10.0
+            VELOCITY_BASE_SPEED = int(VELOCITY_BASE_SPEED)
+            VELOCITY_BASE_SPEED += 1.0
+            VELOCITY_BASE_SPEED /= 10.0
     
     def _decrease_speed(self):
-    	global VELOCITY_BASE_SPEED
-    	if VELOCITY_BASE_SPEED > 0.1:
-    		VELOCITY_BASE_SPEED *= 10.0
-    		VELOCITY_BASE_SPEED = int(VELOCITY_BASE_SPEED)
-    		VELOCITY_BASE_SPEED -= 1.0
-    		VELOCITY_BASE_SPEED /= 10.0
+        global VELOCITY_BASE_SPEED
+        if VELOCITY_BASE_SPEED > 0.1:
+            VELOCITY_BASE_SPEED *= 10.0
+            VELOCITY_BASE_SPEED = int(VELOCITY_BASE_SPEED)
+            VELOCITY_BASE_SPEED -= 1.0
+            VELOCITY_BASE_SPEED /= 10.0
     
     def _increase_accuracy(self):
-    	global VELOCITY_CMD_DURATION
-    	if VELOCITY_CMD_DURATION < 1.0:
-    		VELOCITY_CMD_DURATION *= 10.0
-    		VELOCITY_CMD_DURATION = int(VELOCITY_CMD_DURATION)
-    		VELOCITY_CMD_DURATION += 1.0
-    		VELOCITY_CMD_DURATION /= 10.0
+        global VELOCITY_CMD_DURATION
+        if VELOCITY_CMD_DURATION < 1.0:
+            VELOCITY_CMD_DURATION *= 10.0
+            VELOCITY_CMD_DURATION = int(VELOCITY_CMD_DURATION)
+            VELOCITY_CMD_DURATION += 1.0
+            VELOCITY_CMD_DURATION /= 10.0
     
     def _decrease_accuracy(self):
-    	global VELOCITY_CMD_DURATION
-    	if VELOCITY_CMD_DURATION > 0.1:
-    		VELOCITY_CMD_DURATION *= 10.0
-    		VELOCITY_CMD_DURATION = int(VELOCITY_CMD_DURATION)
-    		VELOCITY_CMD_DURATION -= 1.0
-    		VELOCITY_CMD_DURATION /= 10.0
+        global VELOCITY_CMD_DURATION
+        if VELOCITY_CMD_DURATION > 0.1:
+            VELOCITY_CMD_DURATION *= 10.0
+            VELOCITY_CMD_DURATION = int(VELOCITY_CMD_DURATION)
+            VELOCITY_CMD_DURATION -= 1.0
+            VELOCITY_CMD_DURATION /= 10.0
 
     def _velocity_cmd_helper(self, desc='', v_x=0.0, v_y=0.0, v_rot=0.0):
         self._start_robot_command(
             desc, RobotCommandBuilder.synchro_velocity_command(v_x=v_x, v_y=v_y, v_rot=v_rot),
             end_time_secs=time.time() + VELOCITY_CMD_DURATION)
+            
+    def _stow(self):
+        self._start_robot_command('stow', RobotCommandBuilder.arm_stow_command())
+
+    def _unstow(self):
+        self._start_robot_command('stow', RobotCommandBuilder.arm_ready_command())
 
     def _return_to_origin(self):
         self._start_robot_command(
@@ -478,12 +611,13 @@ class RecorderInterface(object):
             return
 
         if power_state == robot_state_proto.PowerState.STATE_OFF:
-            self._try_grpc("powering-on", self._request_power_on)
+            self._try_grpc_async("powering-on", self._request_power_on)
         else:
             self._try_grpc("powering-off", self._safe_power_off)
 
     def _request_power_on(self):
-        bosdyn.client.power.power_on(self._power_client)
+        request = PowerServiceProto.PowerCommandRequest.REQUEST_ON
+        return self._power_client.power_command_async(request)
 
     def _safe_power_off(self):
         self._start_robot_command('safe_power_off', RobotCommandBuilder.safe_power_off_command())
@@ -701,69 +835,129 @@ class RecorderInterface(object):
                 self._waypoint_commands += [self._waypoint_id]
                 
     def _take_back_fisheye_image(self):
-    	self.take_image("back_fisheye_image")
+        self._take_image("back_fisheye_image")
     
     def _take_left_fisheye_image(self):
-    	self.take_image("left_fisheye_image")
+        self._take_image("left_fisheye_image")
     
     def _take_frontleft_fisheye_image(self):
-    	self.take_image("frontleft_fisheye_image")
+        self._take_image("frontleft_fisheye_image")
     
     def _take_frontright_fisheye_image(self):
-    	self.take_image("frontright_fisheye_image")	
-	
+        self._take_image("frontright_fisheye_image")    
+    
     def _take_right_fisheye_image(self):
-    	self.take_image("right_fisheye_image")
+        self._take_image("right_fisheye_image")
     
     def _take_hand_color_image(self):
-    	self.take_image("hand_color_image")
+        self._take_image("hand_color_image")
+        
+    def _view_back_fisheye_image(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._image_viewer("back_fisheye_image"))
     
-    def take_image(self, image_source_name):
-    	# Capture and save images to disk
-    	pixel_format = dict(image_pb2.Image.PixelFormat.items()).get(None)
-    	image_request = [build_image_request(image_source_name, pixel_format=pixel_format)]
-    	image = self._image_client.get_image(image_request)[0]
+    def _view_left_fisheye_image(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._image_viewer("left_fisheye_image"))
+    
+    def _view_frontleft_fisheye_image(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._image_viewer("frontleft_fisheye_image"))
+    
+    def _view_frontright_fisheye_image(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._image_viewer("frontright_fisheye_image") )   
+    
+    def _view_right_fisheye_image(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._image_viewer("right_fisheye_image"))
+    
+    def _view_hand_color_image(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._image_viewer("hand_color_image"))
 
-    	num_bytes = 1  # Assume a default of 1 byte encodings.
-    	if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
-    		dtype = np.uint16
-    		extension = ".png"
-    	else:
-    		if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGB_U8:
-    			num_bytes = 3
-    		elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGBA_U8:
-    			num_bytes = 4
-    		elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U8:
-    			num_bytes = 1
-    		elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U16:
-    			num_bytes = 2
-    		dtype = np.uint8
-    		extension = ".jpg"
+    def _take_image(self, image_source_name):
+        # Capture and save images to disk
+        pixel_format = dict(image_pb2.Image.PixelFormat.items()).get(None)
+        image_request = [build_image_request(image_source_name, pixel_format=pixel_format)]
+        image = self._image_client.get_image(image_request)[0]
 
-    	img = np.frombuffer(image.shot.image.data, dtype=dtype)
-    	if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
-    		try:
-    			# Attempt to reshape array into a RGB rows X cols shape.
-    			img = img.reshape((image.shot.image.rows, image.shot.image.cols, num_bytes))
-    		except ValueError:
-    			# Unable to reshape the image data, trying a regular decode.
-    			img = cv2.imdecode(img, -1)
-    	else:
-    		img = cv2.imdecode(img, -1)
+        num_bytes = 1  # Assume a default of 1 byte encodings.
+        if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
+            dtype = np.uint16
+            extension = ".png"
+        else:
+            if image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGB_U8:
+                num_bytes = 3
+            elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_RGBA_U8:
+                num_bytes = 4
+            elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U8:
+                num_bytes = 1
+            elif image.shot.image.pixel_format == image_pb2.Image.PIXEL_FORMAT_GREYSCALE_U16:
+                num_bytes = 2
+            dtype = np.uint8
+            extension = ".jpg"
 
-    	ROTATION_ANGLE = {'back_fisheye_image': 0, 'frontleft_fisheye_image': -78, 'frontright_fisheye_image': -102, 'left_fisheye_image': 0, 'right_fisheye_image': 180, 'hand_color_image': 0}
-    	img = ndimage.rotate(img, ROTATION_ANGLE[image.source.name])
-    	
-    	# Save the image from the GetImage request to the current directory with the filename
-    	# matching that of the image source.
-    	if not os.path.exists(self._download_filepath):
-    		os.mkdir(self._download_filepath)
-    	image_saved_path = os.path.join(self._download_filepath, "images")
-    	if not os.path.exists(image_saved_path):
-    		os.mkdir(image_saved_path)
-    	image_saved_name = image.source.name.replace("/", '')
-    	cv2.imwrite(image_saved_path + "/" + image_saved_name + extension, img)
-	
+        img = np.frombuffer(image.shot.image.data, dtype=dtype)
+        if image.shot.image.format == image_pb2.Image.FORMAT_RAW:
+            try:
+                # Attempt to reshape array into a RGB rows X cols shape.
+                img = img.reshape((image.shot.image.rows, image.shot.image.cols, num_bytes))
+            except ValueError:
+                # Unable to reshape the image data, trying a regular decode.
+                img = cv2.imdecode(img, -1)
+        else:
+            img = cv2.imdecode(img, -1)
+
+        ROTATION_ANGLE = {'back_fisheye_image': 0, 'frontleft_fisheye_image': -78,
+                          'frontright_fisheye_image': -102, 'left_fisheye_image': 0,
+                          'right_fisheye_image': 180, 'hand_color_image': 0}
+        img = ndimage.rotate(img, ROTATION_ANGLE[image.source.name])
+        
+        # Save the image from the GetImage request to the current directory with the filename
+        # matching that of the image source.
+        if not os.path.exists(self._download_filepath):
+            os.mkdir(self._download_filepath)
+        image_saved_path = os.path.join(self._download_filepath, "images")
+        if not os.path.exists(image_saved_path):
+            os.mkdir(image_saved_path)
+        image_saved_name = image.source.name.replace("/", '')
+        cv2.imwrite(image_saved_path + "/" + image_saved_name + extension, img)
+
+    def _reset_image_client(self, robot):
+        """Recreate the ImageClient from the robot object."""
+        del _robot.service_clients_by_name['image']
+        del _robot.channels_by_authority['api.spot.robot']
+        return _robot.ensure_client('image')
+        
+    def _image_viewer(self, image_source_name):
+        requests = [build_image_request(image_source_name, quality_percent=100)]
+        cv2.setWindowProperty(image_source_name, cv2.WND_PROP_AUTOSIZE, cv2.WINDOW_AUTOSIZE)
+
+        keystroke = None
+        timeout_count_before_reset = 0
+        while keystroke != 113 and keystroke != 27:
+            try:
+                images_future = self._image_client.get_image_async(requests, timeout=0.5)
+                while not images_future.done():
+                    keystroke = cv2.waitKey(25)
+                    if keystroke == 27 or keystroke == 113:
+                        break
+                images = images_future.result()
+            except TimedOutError as time_err:
+                if timeout_count_before_reset == 5:
+                    self._image_client = self._reset_image_client(robot)
+                    timeout_count_before_reset = 0
+                else:
+                    timeout_count_before_reset += 1
+            except Exception as err:
+                continue
+            image, _ = self._image_to_opencv(images[0])
+            cv2.imshow(images[0].source.name, image)
+            keystroke = cv2.waitKey(100)
+        cv2.destroyAllWindows()
+        return
+    
     def _generate_mission(self):
         """Save graph map and mission file."""
 
@@ -784,7 +978,7 @@ class RecorderInterface(object):
 
         # Save graph map
         if not os.path.exists(self._download_filepath):
-        	os.mkdir(self._download_filepath)
+            os.mkdir(self._download_filepath)
         if not self._download_full_graph():
             self.add_message("ERROR: Error downloading graph.")
             return
