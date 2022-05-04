@@ -29,9 +29,7 @@ import numpy as np
 import asyncio
 
 from PIL import Image, ImageEnhance
-
 from google.protobuf import wrappers_pb2 as wrappers
-
 from scipy import ndimage
 
 from bosdyn.api import geometry_pb2, world_object_pb2, image_pb2
@@ -65,6 +63,7 @@ from bosdyn.client.image import ImageClient, build_image_request
 
 LOGGER = logging.getLogger()
 
+# Velocity settings for navigation
 VELOCITY_BASE_SPEED = 0.5  # m/s
 VELOCITY_BASE_ANGULAR = 1.2  # rad/sec
 VELOCITY_CMD_DURATION = 0.6  # seconds
@@ -81,13 +80,13 @@ NAV_VELOCITY_LIMITS = geometry_pb2.SE2VelocityLimit(
             linear=geometry_pb2.Vec2(x=-NAV_VELOCITY_MAX_X, y=-NAV_VELOCITY_MAX_Y),
             angular=-NAV_VELOCITY_MAX_YAW))
 
-
 def _grpc_or_log(desc, thunk):
     try:
         return thunk()
     except (ResponseError, RpcError) as err:
         LOGGER.error("Failed %s: %s" % (desc, err))
-        
+
+# Convert raw image file to cv2
 def _image_to_opencv(image):
     """Convert an image proto message to an openCV image."""
     num_channels = 1  # Assume a default of 1 byte encodings.
@@ -165,7 +164,7 @@ class CursesHandler(logging.Handler):
         msg = msg.replace('\n', ' ').replace('\r', '')
         self._wasd_interface.add_message('{:s} {:s}'.format(record.levelname, msg))
 
-
+# Async get robot state
 class AsyncRobotState(AsyncPeriodicQuery):
     """Grab robot state."""
 
@@ -176,6 +175,7 @@ class AsyncRobotState(AsyncPeriodicQuery):
     def _start_query(self):
         return self._client.get_robot_state_async()
 
+# Async get robot image
 class AsyncImageCapture(AsyncGRPCTask):
     """Grab camera images from the robot."""
 
@@ -231,8 +231,12 @@ class RecorderInterface(object):
         # Flag indicating whether robot is in feature desert mode
         self._desert_mode = False
 
-        # Filepath for the location to put the downloaded graph and snapshots.
+        # Filepath for the data.
         self._download_filepath = download_filepath
+        
+        # Filepath for the mission.
+        mission_filepath = os.path.join(self._download_filepath, "Mission Replay")
+        self._mission_filepath = mission_filepath
 
         # List of waypoint commands
         self._waypoint_commands = []
@@ -382,7 +386,7 @@ class RecorderInterface(object):
             LOGGER.addHandler(curses_handler)
 
             stdscr.nodelay(True)  # Don't block for user input.
-            stdscr.resize(34, 96)
+            stdscr.resize(48, 96)
             stdscr.refresh()
 
             # for debug
@@ -419,36 +423,39 @@ class RecorderInterface(object):
     def _drive_draw(self, stdscr, lease_keep_alive):
         """Draw the interface screen at each update."""
         stdscr.clear()  # clear screen
-        stdscr.resize(34, 96)
-        stdscr.addstr(0, 0, '{:20s} {}'.format(self._robot_id.nickname,
-                                               self._robot_id.serial_number))
+        stdscr.resize(48, 96)
+        stdscr.addstr(0, 0, self._title_str())
         stdscr.addstr(1, 0, self._lease_str(lease_keep_alive))
         stdscr.addstr(2, 0, self._battery_str())
         stdscr.addstr(3, 0, self._estop_str())
         stdscr.addstr(4, 0, self._power_state_str())
-        stdscr.addstr(5, 0, self._speed_str())
-        stdscr.addstr(6, 0, self._accuracy_str())
-        stdscr.addstr(7, 0, self._time_sync_str())
-        stdscr.addstr(8, 0, self._waypoint_str())
-        stdscr.addstr(9, 0, self._fiducial_str())
-        stdscr.addstr(10, 0, self._desert_str())
+        stdscr.addstr(5, 0, self._speed_accuracy_str())
+        stdscr.addstr(6, 0, self._time_sync_str())
+        stdscr.addstr(7, 0, self._waypoint_str())
+        stdscr.addstr(8, 0, self._fiducial_str())
+        stdscr.addstr(9, 0, self._desert_str())
         for i in range(3):
-            stdscr.addstr(11 + i, 2, self.message(i))
-        stdscr.addstr(16, 0, "Commands: [TAB]: quit                               ")
-        stdscr.addstr(17, 0, "          [T]: Time-sync, [SPACE]: Estop, [P]: Power")
-        stdscr.addstr(18, 0, "          Speed Decrease: [-] Increase: [=]         ")
-        stdscr.addstr(19, 0, "          Accuracy Decrease: [[] Increase: []]      ")
-        stdscr.addstr(20, 0, "          [v]: Sit, [f]: Stand, [r]: Self-right     ")
-        stdscr.addstr(21, 0, "          [b]: Charging position                    ")
-        stdscr.addstr(22, 0, "          [1-6]: Take image (b, l, fl, fr, r)       ")
-        stdscr.addstr(23, 0, "          [u]: Unstow, [j]: Stow                    ")
-        stdscr.addstr(24, 0, "          [wasd]: Directional strafing              ")
-        stdscr.addstr(25, 0, "          [qe]: Turning, [ESC]: Stop                ")
-        stdscr.addstr(26, 0, "          [m]: Start recording mission              ")
-        stdscr.addstr(27, 0, "          [l]: Add fiducial localization to mission ")
-        stdscr.addstr(28, 0, "          [z]: Enter desert mode                    ")
-        stdscr.addstr(29, 0, "          [x]: Exit desert mode                     ")
-        stdscr.addstr(30, 0, "          [g]: Stop recording and generate mission  ")
+            stdscr.addstr(10 + i, 2, self.message(i))
+        stdscr.addstr(15, 0, "[TAB]: Quit               [ESC]: Stop")
+        stdscr.addstr(16, 0, "[P]: Power                [SPACE]: Estop")
+        stdscr.addstr(17, 0, "[T]: Time-sync")
+        stdscr.addstr(19, 0, "[-]: Speed decrease       [=]: Speed increase")
+        stdscr.addstr(20, 0, "[[]: Accuracy decrease    []]: Accuracy increase")
+        stdscr.addstr(21, 0, "[w]: Forward              [s]: Backward")
+        stdscr.addstr(22, 0, "[a]: Left                 [d]: Right")
+        stdscr.addstr(23, 0, "[q]: Turn left            [e]: Turn right")
+        stdscr.addstr(24, 0, "[v]: Sit                  [f]: Stand")
+        stdscr.addstr(25, 0, "[r]: Self-right           [b]: Charging position")
+        stdscr.addstr(26, 0, "[j]: Stow                 [u]: Unstow")
+        stdscr.addstr(27, 0, "[D]: Open door            [G]: Grab object")
+        stdscr.addstr(28, 0, "[L]: Light on/off         [K]: Gripper open/close")
+        stdscr.addstr(29, 0, "[1-6]: Take image (back, left, front left, front left, right)")
+        stdscr.addstr(30, 0, "[farrow]: Live view front [barrow]: Live view back")
+        stdscr.addstr(31, 0, "[larrow]: Live view left  [rarrow]: Live view right")
+        stdscr.addstr(32, 0, "[/]: Live view arm")
+        stdscr.addstr(34, 0, "[m]: Start mission        [g]: Stop mission")
+        stdscr.addstr(35, 0, "[z]: Enter desert mode    [x]: Exit desert mode")
+        stdscr.addstr(36, 0, "[l]: Add fiducial localization to mission")
         
         if self._image_task.image is not None:
             cv2.setWindowProperty('Viewer', cv2.WND_PROP_AUTOSIZE, cv2.WINDOW_AUTOSIZE)
@@ -641,17 +648,11 @@ class RecorderInterface(object):
         state_str = robot_state_proto.PowerState.MotorPowerState.Name(power_state)
         return 'Power: {}'.format(state_str[6:])  # get rid of STATE_ prefix
     
-    def _speed_str(self):
+    def _speed_accuracy_str(self):
         power_state = self._power_state()
         if power_state is None:
             return ''
-        return 'Speed: {}'.format(VELOCITY_BASE_SPEED)
-        
-    def _accuracy_str(self):
-        power_state = self._power_state()
-        if power_state is None:
-            return ''
-        return 'Command Duration: {}'.format(VELOCITY_CMD_DURATION)
+        return 'Speed: {} | Command Duration: {}'.format(VELOCITY_BASE_SPEED, VELOCITY_CMD_DURATION)
 
     def _estop_str(self):
         if not self._estop_client:
@@ -712,6 +713,10 @@ class RecorderInterface(object):
             return '[ FEATURE DESERT MODE ]'
         else:
             return ''
+            
+    def _title_str(self):
+    	length = 80 - len(self._robot_id.nickname) - len(self._robot_id.serial_number)
+    	return '{}{}{}'.format(self._robot_id.nickname, ' '*length, self._robot_id.serial_number)
 
     def _battery_str(self):
         if not self.robot_state:
@@ -721,7 +726,7 @@ class RecorderInterface(object):
         status = status[7:]  # get rid of STATUS_ prefix
         if battery_state.charge_percentage.value:
             bar_len = int(battery_state.charge_percentage.value) // 10
-            bat_bar = '|{}{}|'.format('=' * bar_len, ' ' * (10 - bar_len))
+            bat_bar = ' |{}{}|'.format('=' * bar_len, ' ' * (10 - bar_len))
         else:
             bat_bar = ''
         time_left = ''
@@ -918,7 +923,7 @@ class RecorderInterface(object):
         # matching that of the image source.
         if not os.path.exists(self._download_filepath):
             os.mkdir(self._download_filepath)
-        image_saved_path = os.path.join(self._download_filepath, "images")
+        image_saved_path = os.path.join(self._download_filepath, "Images")
         if not os.path.exists(image_saved_path):
             os.mkdir(image_saved_path)
         image_saved_name = image.source.name.replace("/", '')
@@ -979,6 +984,8 @@ class RecorderInterface(object):
         # Save graph map
         if not os.path.exists(self._download_filepath):
             os.mkdir(self._download_filepath)
+        if not os.path.exists(self._mission_filepath):
+            os.mkdir(self._mission_filepath)
         if not self._download_full_graph():
             self.add_message("ERROR: Error downloading graph.")
             return
@@ -987,8 +994,8 @@ class RecorderInterface(object):
         mission = self._make_mission()
 
         # Save mission file
-        os.mkdir(os.path.join(self._download_filepath, "missions"))
-        mission_filepath = os.path.join(self._download_filepath, "missions", "autogenerated")
+        os.mkdir(os.path.join(self._mission_filepath, "missions"))
+        mission_filepath = os.path.join(self._mission_filepath, "missions", "autogenerated")
         write_mission(mission, mission_filepath)
 
         # Quit program
@@ -1043,7 +1050,7 @@ class RecorderInterface(object):
     def _write_full_graph(self, graph):
         """Download the graph from robot to the specified, local filepath location."""
         graph_bytes = graph.SerializeToString()
-        write_bytes(self._download_filepath, 'graph', graph_bytes)
+        write_bytes(self._mission_filepath, 'graph', graph_bytes)
 
     def _download_and_write_waypoint_snapshots(self, waypoints):
         """Download the waypoint snapshots from robot to the specified, local filepath location."""
@@ -1056,7 +1063,7 @@ class RecorderInterface(object):
                 # Failure in downloading waypoint snapshot. Continue to next snapshot.
                 self.add_message("Failed to download waypoint snapshot: " + waypoint.snapshot_id)
                 continue
-            write_bytes(os.path.join(self._download_filepath, 'waypoint_snapshots'),
+            write_bytes(os.path.join(self._mission_filepath, 'waypoint_snapshots'),
                         waypoint.snapshot_id, waypoint_snapshot.SerializeToString())
             num_waypoint_snapshots_downloaded += 1
             self.add_message("Downloaded {} of the total {} waypoint snapshots.".format(
@@ -1076,7 +1083,7 @@ class RecorderInterface(object):
                 # Failure in downloading edge snapshot. Continue to next snapshot.
                 self.add_message("Failed to download edge snapshot: " + edge.snapshot_id)
                 continue
-            write_bytes(os.path.join(self._download_filepath, 'edge_snapshots'),
+            write_bytes(os.path.join(self._mission_filepath, 'edge_snapshots'),
                         edge.snapshot_id, edge_snapshot.SerializeToString())
             num_edge_snapshots_downloaded += 1
             self.add_message("Downloaded {} of the total {} edge snapshots.".format(
@@ -1297,7 +1304,7 @@ def main():
     if options.waypoint_commands_only is not None:
         recorder_interface._waypoint_commands = options.waypoint_commands_only
         # Save graph map
-        os.mkdir(recorder_interface._download_filepath)
+        os.mkdir(recorder_interface._mission_filepath)
         if not recorder_interface._download_full_graph(overwrite_desert_flag=[]):
             recorder_interface.add_message("ERROR: Error downloading graph.")
             return
@@ -1307,8 +1314,8 @@ def main():
         mission = recorder_interface._make_mission()
 
         # Save mission file
-        os.mkdir(recorder_interface._download_filepath + "/missions")
-        mission_filepath = recorder_interface._download_filepath + "/missions/autogenerated"
+        os.mkdir(recorder_interface._mission_filepath + "/missions")
+        mission_filepath = recorder_interface._mission_filepath + "/missions/autogenerated"
         write_mission(mission, mission_filepath)
         return True
 
